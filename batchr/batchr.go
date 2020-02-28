@@ -38,10 +38,10 @@ import (
 type DB struct{
 	// Valid all the time.
 	perst *badger.DB
-	cache *bbolt.DB
+	cache *bbolt.DB  // transaction bypass cache
 	
 	queue  chan *util.Entry2
-	txnsem chan int
+	txnsem chan int // A semaphore, limiting the number of maximum concurrent transactions.
 	
 	pool util.Entry2Pool
 	commitErr error
@@ -62,11 +62,14 @@ type removeFrom struct{
 func (removeFrom) VisitFull(key, value []byte) bbolt.VisitOp { return bbolt.VisitOpDELETE() }
 var removeFromRef bbolt.Visitor = removeFrom{}
 
+func (db *DB) cacheUpdate(fu func(tx *bbolt.Tx)error) error{
+	return db.cache.Batch(fu)
+}
 func (db *DB) commitDone(reslist *ring.Ring) func(error) {
 	return func(e error) {
 		<- db.txnsem
 		if e!=nil { db.commitErr = e }
-		db.cache.Update(func(tx *bbolt.Tx)error {
+		db.cacheUpdate(func(tx *bbolt.Tx)error {
 			bkt := tx.Bucket(defbucket)
 			util.Foreach(reslist,func(e *util.Entry2) { bkt.Accept(e.Key,removeFromRef,true) })
 			return nil
@@ -84,34 +87,56 @@ func (db *DB) worker() {
 	var txn *badger.Txn
 	var res *ring.Ring
 	
-	
 	for {
+		// Clear the pointer on every iteration.
 		ent = nil
+		
 		if txn!=nil {
+			/*
+			If there is an active transaction, receive the next Entry with a timeout.
+			*/
 			select {
 			case ent = <- db.queue:
 			case <- ticker.C:
+				/*
+				Receive 3 ticker events, before timing out.
+				- As the Channel usually is filled with an old event, the first event will be immediate.
+				- The second event will propably come from a half-consumed timeslice (less than 1ms).
+				- The third event will be the consumption of a full Timeslice (1ms).
+				Putting all together, this results in a timeout of 1-3ms.
+				*/
 				ticks++
 				if ticks<3 { continue }
 			}
 		} else {
+			/*
+			If no transaction is active, just wait for the next Entry.
+			XXX: We assume, that the Entry is not <nil>
+			*/
 			ent = <- db.queue
 		}
 		ticks = 0
 		
 		if ent==nil {
+			/* If we got here, we encountered a timeout. */
 			txn.CommitWith(db.commitDone(res))
 			txn = nil
 			res = nil
-			if ent==nil { continue }
+			continue
 		}
 		if txn==nil {
+			/* If there is no running transaction, start one. */
 			db.txnsem <- 0
 			txn = db.perst.NewTransaction(true)
 			res = util.ListHead()
 		}
 		if len(ent.Value)==0 {
+			/*
+			If there is no value, this Entry is meant as a Delete-Request, to revert an earlier insert.
+			*/
 			err := txn.Delete(ent.Key)
+			
+			/* If the Transaction is full, commit and restart. */
 			if err==badger.ErrTxnTooBig {
 				txn.CommitWith(db.commitDone(res))
 				db.txnsem <- 0
@@ -119,11 +144,14 @@ func (db *DB) worker() {
 				res = util.ListHead()
 				txn.Delete(ent.Key)
 			}
-			// Let the GC deal with the Entry2 object!
+			// Let the GC deal with the Entry object!
 			continue
 		}
+		
 		bent := &badger.Entry{Key:ent.Key,Value:ent.Value,ExpiresAt:ent.ExpiresAt}
 		err := txn.SetEntry(bent)
+		
+		/* If the Transaction is full, commit and restart. */
 		if err==badger.ErrTxnTooBig {
 			txn.CommitWith(db.commitDone(res))
 			db.txnsem <- 0
@@ -171,21 +199,38 @@ func (db *DB) SetEntry(e *kvi.Entry) error {
 	defer inst.free()
 	inst.e2 = e2;
 	
-	db.cache.Update(func(tx *bbolt.Tx)error{
+	/*
+	Step 1: Install the Entry in the transaction bypass, to make it observable.
+	*/
+	db.cacheUpdate(func(tx *bbolt.Tx)error{
 		tx.Bucket(defbucket).Accept(e2.Key,inst,true)
 		return nil
 	})
+	
+	// If an Entry with that key already existed in the transaction bypass, fail.
 	if !inst.success { return kvi.ErrKeyAlreadyExists }
+	
+	/*
+	Step 2: Submit the insertion to the Datastore.
+	*/
 	db.queue <- e2.Grab()
 	return nil
 }
 func (db *DB) RevertSet(key []byte) error {
 	if isValidKey(key) || len(key)==0 { return kvi.ErrInvalidKey }
 	e2 := db.pool.Alloc().SetKey(key)
-	db.cache.Batch(func(tx *bbolt.Tx) error {
+	
+	/*
+	Clear the Entry from the transaction bypass.
+	*/
+	db.cacheUpdate(func(tx *bbolt.Tx) error {
 		tx.Bucket(defbucket).Accept(e2.Key,removeFromRef,true)
 		return nil
 	})
+	
+	/*
+	Also clear the Entry from the Datastore.
+	*/
 	db.queue <- e2
 	return nil
 }
@@ -193,15 +238,17 @@ func (db *DB) RevertSet(key []byte) error {
 
 func (db *DB) HasValue(key []byte) error {
 	ok := false
+	// Check the transaction bypass for the entry.
 	db.cache.View(func(tx *bbolt.Tx) error{
 		ok = len(tx.Bucket(defbucket).Get(key))>0
 		return nil
 	})
 	if ok { return nil }
 	
+	// Check the datastore
 	return db.perst.View(func(txn *badger.Txn) error{
 		_,err := txn.Get(key)
-		return err
+		return swapError(err)
 	})
 }
 
@@ -230,15 +277,24 @@ func (db *DB) GetValue(key []byte,cb func(val []byte)error) error {
 	g := getterPool.Get().(*getter)
 	defer g.free()
 	g.cb = cb
+	
+	// TODO: Can we perform a lookup on the datastore and the cache concurrently?
+	
+	/*
+	Try to fetch the Entry from the transaction bypass.
+	*/
 	db.cache.View(func(tx *bbolt.Tx) error{
 		return tx.Bucket(defbucket).Accept(key,g,false)
 	})
 	if g.done { return g.err }
 	
+	/*
+	Try to fetch the Entry from the Datastore.
+	*/
 	return db.perst.View(func(txn *badger.Txn) error{
 		item,err := txn.Get(key)
-		if err==nil { err = item.Value(cb) }
-		return err
+		if err!=nil { return swapError(err) }
+		return item.Value(cb)
 	})
 }
 
